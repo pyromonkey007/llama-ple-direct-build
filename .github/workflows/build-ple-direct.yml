@@ -1,0 +1,240 @@
+name: Build PLE-Direct Windows CUDA 12.4 sm61
+
+# Read-only cloud build of the experimental PLE-direct llama.cpp commit.
+# Produces a portable llama-server package for a GTX 1080 Ti (sm_61) with
+# BOTH CPU and CUDA backends enabled (mixed inference).
+#
+# Hardening:
+#   * cuobjdump proof that ggml-cuda.dll really contains sm_61 code
+#   * BUILD-MANIFEST.txt (reproducibility + per-file SHA256), shipped in the ZIP
+#   * upload-artifact uses if-no-files-found: error (fail instead of silent empty)
+
+on:
+  workflow_dispatch:
+
+env:
+  SRC_REPO: NovNovikov/llama.cpp
+  SRC_SHA: 4392224b5e92f39ab6b78c49279101f68fbacec3
+
+jobs:
+  build-ple-direct:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout experimental source (pinned to exact SHA)
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ env.SRC_SHA }}
+          path: src
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Verify pinned SHA
+        shell: pwsh
+        run: |
+          $got = (git -C src rev-parse HEAD).Trim()
+          Write-Host "checked out: $got"
+          if ($got -ne "${{ env.SRC_SHA }}") { throw "SHA mismatch: $got" }
+
+      - name: Source verification (Windows PLE direct reader present in pinned commit)
+        shell: pwsh
+        run: |
+          $lr = "src\src\llama-lazy-reader.h"
+          $qx = "src\src\models\qwen4exp.cpp"
+          $mx = "src\src\llama-model.cpp"
+          if (-not (Test-Path $lr)) { throw "missing $lr" }
+          $a = Get-Content $lr -Raw
+          foreach ($t in @("CreateFileW","OVERLAPPED","ReadFile")) {
+            if ($a -notmatch $t) { throw "llama-lazy-reader.h is missing '$t'" }
+          }
+          $b = Get-Content $qx -Raw
+          if ($b -notmatch 'TENSOR_READ_LAZY')   { throw "qwen4exp.cpp is missing TENSOR_READ_LAZY" }
+          if ($b -notmatch 'load_lazy_reader')   { throw "qwen4exp.cpp is missing load_lazy_reader" }
+          $c = Get-Content $mx -Raw
+          if ($c -notmatch 'direct reads enabled for') { throw "llama-model.cpp is missing the direct-read activation log" }
+          Write-Host "OK: Windows PLE direct-read implementation present (CreateFileW/OVERLAPPED/ReadFile + qwen4exp lazy PLE reader)"
+
+      - name: Install CUDA Toolkit 12.4 (official NVIDIA redist, repo action)
+        uses: ./src/.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '12.4'
+          cuda_arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Record toolchain versions
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          echo === cl === > toolchain.txt
+          cl 2>&1 | findstr /C:"Version" >> toolchain.txt
+          echo === nvcc === >> toolchain.txt
+          nvcc --version >> toolchain.txt 2>&1
+          echo === cmake === >> toolchain.txt
+          cmake --version >> toolchain.txt 2>&1
+          echo === ninja === >> toolchain.txt
+          ninja --version >> toolchain.txt 2>&1
+          echo === CUDA_PATH=%CUDA_PATH% === >> toolchain.txt
+          type toolchain.txt
+
+      - name: Configure (Release, CPU+CUDA, sm_61)
+        shell: pwsh
+        run: |
+          cmd /c '"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 && cmake -S src -B build -G "Ninja Multi-Config" -DGGML_BACKEND_DL=ON -DGGML_CPU=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=61 -DGGML_CUDA_CUB_3DOT2=ON -DLLAMA_BUILD_BORINGSSL=ON' 2>&1 | Tee-Object -FilePath configure.log
+
+      - name: Build llama-server (Release)
+        shell: pwsh
+        run: |
+          cmd /c '"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 && cmake --build build --config Release --target llama-server -j %NUMBER_OF_PROCESSORS%' 2>&1 | Tee-Object -FilePath build.log
+
+      - name: Static verify (no model load, no GPU required)
+        shell: pwsh
+        run: |
+          $exe = "build\bin\Release\llama-server.exe"
+          if (-not (Test-Path $exe)) { throw "llama-server.exe not found at $exe" }
+          & $exe --version 2>&1 | Tee-Object -FilePath version.txt
+          & $exe --help    2>&1 | Out-File -Encoding utf8 help.txt
+          $h = Get-Content help.txt -Raw
+          if ($h -notmatch '--lazy-mode') { throw "help is missing --lazy-mode" }
+          if ($h -notmatch 'on-direct')   { throw "help is missing on-direct" }
+          Write-Host "OK: --lazy-mode and on-direct are present in llama-server --help"
+
+      - name: Verify sm_61 cubins in ggml-cuda.dll (cuobjdump)
+        shell: pwsh
+        run: |
+          $dll = "build\bin\Release\ggml-cuda.dll"
+          if (-not (Test-Path $dll)) { throw "ggml-cuda.dll not found at $dll" }
+          $cuobj = Join-Path $env:CUDA_PATH "bin\cuobjdump.exe"
+          if (-not (Test-Path $cuobj)) { throw "cuobjdump.exe not found at $cuobj" }
+          Remove-Item cuda-architectures.txt -ErrorAction SilentlyContinue
+          "=== cuobjdump --list-elf $dll ===" | Out-File -Encoding utf8 cuda-architectures.txt
+          & $cuobj --list-elf $dll 2>&1 | Out-File -Append -Encoding utf8 cuda-architectures.txt
+          "=== cuobjdump --list-ptx $dll ===" | Out-File -Append -Encoding utf8 cuda-architectures.txt
+          & $cuobj --list-ptx $dll 2>&1 | Out-File -Append -Encoding utf8 cuda-architectures.txt
+          $txt = Get-Content cuda-architectures.txt -Raw
+          Write-Host $txt
+          if ($txt -notmatch 'sm_61' -and $txt -notmatch 'compute_61') {
+            throw "FAIL: no sm_61 / compute_61 evidence found in ggml-cuda.dll (cuobjdump)"
+          }
+          Write-Host "OK: sm_61 / compute_61 cubin evidence found in ggml-cuda.dll"
+
+      - name: Package portable (exe + all DLLs + CUDA 12.4 runtime)
+        shell: pwsh
+        run: |
+          $pkg = "pkg"
+          if (Test-Path $pkg) { Remove-Item $pkg -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item "build\bin\Release\*" $pkg -Recurse
+          $required = @("llama-server.exe","llama.dll","ggml.dll","ggml-base.dll","ggml-cuda.dll")
+          foreach ($r in $required) {
+            if (-not (Test-Path (Join-Path $pkg $r)) -and -not (Get-ChildItem $pkg -Recurse -Filter $r -ErrorAction SilentlyContinue)) {
+              throw "required build output missing after copy: $r"
+            }
+          }
+          $cudaBin = Join-Path $env:CUDA_PATH "bin"
+          foreach ($d in @("cudart64_12.dll","cublas64_12.dll","cublasLt64_12.dll")) {
+            $s = Join-Path $cudaBin $d
+            if (Test-Path $s) { Copy-Item $s $pkg } else { throw "missing CUDA runtime DLL: $d" }
+          }
+          Copy-Item "cuda-architectures.txt" $pkg -ErrorAction SilentlyContinue
+          Copy-Item "src\LICENSE" $pkg -ErrorAction SilentlyContinue
+          Write-Host "--- package contents ---"
+          Get-ChildItem $pkg | Select-Object Name,Length | Format-Table -AutoSize
+
+      - name: Build reproducibility manifest (BUILD-MANIFEST.txt)
+        shell: pwsh
+        run: |
+          $pkg = "pkg"
+          $L = New-Object System.Collections.Generic.List[string]
+          function Add-Line([string]$s) { $L.Add($s) }
+          Add-Line "=== PLE-Direct build manifest ==="
+          Add-Line ("generated_utc: " + (Get-Date).ToUniversalTime().ToString("o"))
+          Add-Line ("source_repository: ${{ env.SRC_REPO }}")
+          Add-Line ("source_sha_pinned: ${{ env.SRC_SHA }}")
+          Add-Line ("git_rev_parse_HEAD: " + (git -C src rev-parse HEAD).Trim())
+          Add-Line ("runner_os: " + $env:RUNNER_OS)
+          Add-Line ("runner_image: " + $env:ImageOS)
+          Add-Line ("CUDA_PATH: " + $env:CUDA_PATH)
+          Add-Line "CMAKE_CUDA_ARCHITECTURES: 61"
+          Add-Line "--- toolchain ---"
+          $cm=try{ (cmake --version | Select-Object -First 1) }catch{ "unavailable" }
+          Add-Line ("cmake: " + $cm)
+          $nj=try{ (ninja --version) }catch{ "unavailable" }
+          Add-Line ("ninja: " + $nj)
+          $nc=try{ ((nvcc --version) | Select-String 'release') -join ' ' }catch{ "unavailable" }
+          Add-Line ("nvcc: " + $nc)
+          if (Test-Path toolchain.txt) { Add-Line "--- toolchain.txt (cl/nvcc/cmake/ninja block) ---"; Get-Content toolchain.txt | ForEach-Object { Add-Line $_ } }
+          Add-Line "--- CMake configuration flags ---"
+          foreach ($f in @(
+            "-DGGML_BACKEND_DL=ON","-DGGML_CPU=ON","-DGGML_CPU_ALL_VARIANTS=ON","-DGGML_CUDA=ON",
+            "-DGGML_NATIVE=OFF","-DCMAKE_CUDA_ARCHITECTURES=61","-DGGML_CUDA_CUB_3DOT2=ON",
+            "-DLLAMA_BUILD_BORINGSSL=ON","-G Ninja Multi-Config","--config Release","--target llama-server")) { Add-Line ("  " + $f) }
+          Add-Line "--- package files (name, size_bytes, sha256) ---"
+          $files = Get-ChildItem $pkg -File -Recurse | Sort-Object FullName
+          foreach ($f in $files) {
+            $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()
+            $rel = $f.FullName.Substring((Resolve-Path $pkg).Path.Length).TrimStart('\')
+            Add-Line ("{0}`t{1}`t{2}" -f $rel, $f.Length, $h)
+          }
+          Add-Line "--- explicitly required checksums ---"
+          foreach ($want in @("llama-server.exe","llama.dll","ggml.dll","ggml-base.dll","ggml-cuda.dll",
+                              "cudart64_12.dll","cublas64_12.dll","cublasLt64_12.dll")) {
+            $hit = $files | Where-Object { $_.Name -eq $want } | Select-Object -First 1
+            if ($hit) {
+              $h = (Get-FileHash $hit.FullName -Algorithm SHA256).Hash.ToLower()
+              Add-Line ("OK   {0}  {1}  {2}" -f $want, $hit.Length, $h)
+            } else {
+              Add-Line ("MISS {0}" -f $want)
+              if ($want -ne "llama.dll") { throw "required package file missing: $want" }
+            }
+          }
+          $cpuVariants = $files | Where-Object { $_.Name -like 'ggml-cpu*.dll' }
+          Add-Line ("ggml-cpu variant DLLs: " + $cpuVariants.Count)
+          foreach ($cv in $cpuVariants) {
+            $h = (Get-FileHash $cv.FullName -Algorithm SHA256).Hash.ToLower()
+            Add-Line ("OK   {0}  {1}  {2}" -f $cv.Name, $cv.Length, $h)
+          }
+          $manifest = Join-Path $pkg "BUILD-MANIFEST.txt"
+          $L | Set-Content -LiteralPath $manifest -Encoding utf8
+          Write-Host "--- BUILD-MANIFEST.txt ---"
+          Get-Content $manifest
+
+      - name: Create ZIP + SHA256
+        shell: pwsh
+        run: |
+          if (Test-Path llama-server-ple-direct-win-cu124-sm61.zip) { Remove-Item llama-server-ple-direct-win-cu124-sm61.zip -Force }
+          7z a llama-server-ple-direct-win-cu124-sm61.zip ".\pkg\*"
+          if (-not (Test-Path llama-server-ple-direct-win-cu124-sm61.zip)) { throw "ZIP was not created" }
+          $hash = (Get-FileHash llama-server-ple-direct-win-cu124-sm61.zip -Algorithm SHA256).Hash
+          "$hash  llama-server-ple-direct-win-cu124-sm61.zip" | Set-Content llama-server-ple-direct-win-cu124-sm61.zip.sha256
+          Write-Host "ZIP SHA256: $hash"
+          Write-Host ("ZIP size bytes: " + (Get-Item llama-server-ple-direct-win-cu124-sm61.zip).Length)
+
+      - name: Upload artifact (zip + sha256)
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-server-ple-direct-win-cu124-sm61
+          if-no-files-found: error
+          path: |
+            llama-server-ple-direct-win-cu124-sm61.zip
+            llama-server-ple-direct-win-cu124-sm61.zip.sha256
+
+      - name: Upload build logs + manifest + cuda architectures
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-logs-ple-direct
+          if-no-files-found: warn
+          path: |
+            configure.log
+            build.log
+            help.txt
+            version.txt
+            toolchain.txt
+            cuda-architectures.txt
+            pkg\BUILD-MANIFEST.txt
