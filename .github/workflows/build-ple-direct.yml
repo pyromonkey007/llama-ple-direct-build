@@ -64,6 +64,22 @@ jobs:
           cuda_version: '12.4'
           cuda_arch: x64
 
+      - name: Install CUDA cuobjdump 12.4.127 (official NVIDIA redist)
+        shell: pwsh
+        run: |
+          $url = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cuobjdump/windows-x86_64/cuda_cuobjdump-windows-x86_64-12.4.127-archive.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "cuda_cuobjdump-12.4.127.zip"
+          $dst = Join-Path $env:RUNNER_TEMP "cuda-cuobjdump-12.4.127"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          if (-not (Test-Path $zip)) { throw "download failed: $url" }
+          if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
+          Expand-Archive -LiteralPath $zip -DestinationPath $dst -Force
+          $cuobj = Get-ChildItem $dst -Recurse -Filter cuobjdump.exe | Select-Object -First 1
+          if (-not $cuobj) { throw "cuobjdump.exe not found in NVIDIA cuda_cuobjdump archive" }
+          & $cuobj.FullName --version
+          "CUDA_CUOBJDUMP=$($cuobj.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Discovered cuobjdump: $($cuobj.FullName)"
+
       - name: Install Ninja
         run: choco install ninja -y
 
@@ -104,13 +120,25 @@ jobs:
           if ($h -notmatch 'on-direct')   { throw "help is missing on-direct" }
           Write-Host "OK: --lazy-mode and on-direct are present in llama-server --help"
 
+      - name: Checkpoint upload (raw build outputs)
+        uses: actions/upload-artifact@v6
+        with:
+          name: ple-direct-raw-build-checkpoint
+          if-no-files-found: error
+          path: |
+            build/bin/Release/**
+            configure.log
+            build.log
+            version.txt
+            help.txt
+
       - name: Verify sm_61 cubins in ggml-cuda.dll (cuobjdump)
         shell: pwsh
         run: |
           $dll = "build\bin\Release\ggml-cuda.dll"
           if (-not (Test-Path $dll)) { throw "ggml-cuda.dll not found at $dll" }
-          $cuobj = Join-Path $env:CUDA_PATH "bin\cuobjdump.exe"
-          if (-not (Test-Path $cuobj)) { throw "cuobjdump.exe not found at $cuobj" }
+          $cuobj = $env:CUDA_CUOBJDUMP
+          if (-not $cuobj -or -not (Test-Path $cuobj)) { throw "CUDA_CUOBJDUMP missing or invalid: $cuobj" }
           Remove-Item cuda-architectures.txt -ErrorAction SilentlyContinue
           "=== cuobjdump --list-elf $dll ===" | Out-File -Encoding utf8 cuda-architectures.txt
           & $cuobj --list-elf $dll 2>&1 | Out-File -Append -Encoding utf8 cuda-architectures.txt
