@@ -94,6 +94,7 @@ jobs:
                   }
               }
           '@
+          $old = $old -replace "`r`n", "`n"
 
           $new = @'
           #ifdef _WIN32
@@ -133,7 +134,9 @@ jobs:
                   }
               }
           '@
+          $new = $new -replace "`r`n", "`n"
 
+          Write-Host ("patch diag: orig_len={0} old_len={1} orig_CR={2} old_CR={3}" -f $orig.Length, $old.Length, ([regex]::Matches($orig,"`r").Count), ([regex]::Matches($old,"`r").Count))
           if (-not $orig.Contains($old)) { throw "PATCH ANCHOR NOT FOUND in $path (pinned source changed?)" }
           $patched = $orig.Replace($old, $new)
           if ($patched -eq $orig) { throw "patch produced no change" }
