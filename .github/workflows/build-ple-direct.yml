@@ -5,9 +5,11 @@ name: Build PLE-Direct Windows CUDA 12.4 sm61
 # BOTH CPU and CUDA backends enabled (mixed inference).
 #
 # Hardening:
+#   * local source patch: Windows overlapped READ byte-count fix (llama-lazy-reader.h)
 #   * cuobjdump proof that ggml-cuda.dll really contains sm_61 code
 #   * BUILD-MANIFEST.txt (reproducibility + per-file SHA256), shipped in the ZIP
-#   * upload-artifact uses if-no-files-found: error (fail instead of silent empty)
+#   * checkpoint artifact of the raw build
+#   * final artifact upload fails on missing files
 
 on:
   workflow_dispatch:
@@ -57,6 +59,105 @@ jobs:
           $c = Get-Content $mx -Raw
           if ($c -notmatch 'direct reads enabled for') { throw "llama-model.cpp is missing the direct-read activation log" }
           Write-Host "OK: Windows PLE direct-read implementation present (CreateFileW/OVERLAPPED/ReadFile + qwen4exp lazy PLE reader)"
+
+      - name: Patch Windows direct read (authoritative overlapped byte count)
+        shell: pwsh
+        run: |
+          $path = "src\src\llama-lazy-reader.h"
+          if (-not (Test-Path $path)) { throw "missing $path" }
+          $orig = (Get-Content -LiteralPath $path -Raw) -replace "`r`n", "`n"
+
+          $old = @'
+          #ifdef _WIN32
+              // one positional read; ReadFile takes a DWORD length, so chunk big rows
+              void read_exact(size_t off, uint8_t * dst, size_t n) const {
+                  while (n > 0) {
+                      const DWORD want = n > 0x7FFFFFFFu ? 0x7FFFFFFFu : (DWORD) n;
+                      OVERLAPPED ov = {};
+                      ov.Offset     = (DWORD) (off & 0xFFFFFFFFu);
+                      ov.OffsetHigh = (DWORD) (off >> 32);
+                      DWORD done = 0;
+                      if (!ReadFile((HANDLE) file, dst, want, &done, &ov)) {
+                          if (GetLastError() != ERROR_IO_PENDING ||
+                                  !GetOverlappedResult((HANDLE) file, &ov, &done, TRUE)) {
+                              throw std::runtime_error(format("lazy direct read of %lu bytes at file offset %zu failed, error %lu",
+                                      (unsigned long) want, off, (unsigned long) GetLastError()));
+                          }
+                      }
+                      if (done == 0) {
+                          throw std::runtime_error(format("lazy direct read of %lu bytes at file offset %zu failed: unexpected EOF",
+                                  (unsigned long) want, off));
+                      }
+                      dst += (size_t) done;
+                      off += (size_t) done;
+                      n   -= (size_t) done;
+                  }
+              }
+          '@
+
+          $new = @'
+          #ifdef _WIN32
+              // one positional read; ReadFile takes a DWORD length, so chunk big rows
+              void read_exact(size_t off, uint8_t * dst, size_t n) const {
+                  while (n > 0) {
+                      const DWORD want = n > 0x7FFFFFFFu ? 0x7FFFFFFFu : (DWORD) n;
+                      OVERLAPPED ov = {};
+                      ov.Offset     = (DWORD) (off & 0xFFFFFFFFu);
+                      ov.OffsetHigh = (DWORD) (off >> 32);
+                      DWORD done = 0;
+                      // The handle is opened with FILE_FLAG_OVERLAPPED, so per Microsoft's
+                      // ReadFile contract lpNumberOfBytesRead must be NULL; the authoritative
+                      // transferred-byte count comes from GetOverlappedResult(..., TRUE) for
+                      // BOTH the synchronous (ReadFile == TRUE) and asynchronous
+                      // (ERROR_IO_PENDING) completion paths.
+                      const BOOL started = ReadFile((HANDLE) file, dst, want, nullptr, &ov);
+                      if (!started) {
+                          const DWORD read_err = GetLastError();
+                          if (read_err != ERROR_IO_PENDING) {
+                              throw std::runtime_error(format("lazy direct read of %lu bytes at file offset %zu failed, error %lu",
+                                      (unsigned long) want, off, (unsigned long) read_err));
+                          }
+                      }
+                      if (!GetOverlappedResult((HANDLE) file, &ov, &done, TRUE)) {
+                          const DWORD ov_err = GetLastError();
+                          throw std::runtime_error(format("lazy direct read of %lu bytes at file offset %zu failed, error %lu",
+                                  (unsigned long) want, off, (unsigned long) ov_err));
+                      }
+                      if (done == 0) {
+                          throw std::runtime_error(format("lazy direct read of %lu bytes at file offset %zu failed: unexpected EOF",
+                                  (unsigned long) want, off));
+                      }
+                      dst += (size_t) done;
+                      off += (size_t) done;
+                      n   -= (size_t) done;
+                  }
+              }
+          '@
+
+          if (-not $orig.Contains($old)) { throw "PATCH ANCHOR NOT FOUND in $path (pinned source changed?)" }
+          $patched = $orig.Replace($old, $new)
+          if ($patched -eq $orig) { throw "patch produced no change" }
+          Set-Content -LiteralPath $path -Value $patched -NoNewline -Encoding utf8
+          Copy-Item -LiteralPath $path -Destination "patched-llama-lazy-reader.h" -Force
+          Write-Host "Patched $path (windows_ple_readfile_patch: overlapped-bytecount-v1)"
+
+      - name: Verify applied source patch (fail unless exactly intended)
+        shell: pwsh
+        run: |
+          $path = "src\src\llama-lazy-reader.h"
+          $s = Get-Content -LiteralPath $path -Raw
+          foreach ($t in @("ReadFile","nullptr","GetOverlappedResult","ERROR_IO_PENDING","FILE_FLAG_OVERLAPPED")) {
+            if ($s -notmatch [regex]::Escape($t)) { throw "patched file is missing '$t'" }
+          }
+          if ($s -match '&done, &ov') { throw "obsolete ReadFile(..., &done, &ov) call is still present" }
+          if ($s -match 'GetLastError\(\) != ERROR_IO_PENDING \|\|') { throw "old combined ReadFile/GetOverlappedResult condition is still present" }
+          if ($s -notmatch [regex]::Escape('const BOOL started = ReadFile((HANDLE) file, dst, want, nullptr, &ov);')) {
+            throw "ReadFile(nullptr lpNumberOfBytesRead) form not found"
+          }
+          if ($s -notmatch [regex]::Escape('if (!GetOverlappedResult((HANDLE) file, &ov, &done, TRUE)) {')) {
+            throw "GetOverlappedResult is not called unconditionally for both completion paths"
+          }
+          Write-Host "OK: windows_ple_readfile_patch=overlapped-bytecount-v1 verified (GetOverlappedResult supplies done for both TRUE and ERROR_IO_PENDING)"
 
       - name: Install CUDA Toolkit 12.4 (official NVIDIA redist, repo action)
         uses: ./src/.github/actions/windows-setup-cuda
@@ -170,6 +271,7 @@ jobs:
             if (Test-Path $s) { Copy-Item $s $pkg } else { throw "missing CUDA runtime DLL: $d" }
           }
           Copy-Item "cuda-architectures.txt" $pkg -ErrorAction SilentlyContinue
+          Copy-Item "patched-llama-lazy-reader.h" $pkg -ErrorAction SilentlyContinue
           Copy-Item "src\LICENSE" $pkg -ErrorAction SilentlyContinue
           Write-Host "--- package contents ---"
           Get-ChildItem $pkg | Select-Object Name,Length | Format-Table -AutoSize
@@ -189,6 +291,8 @@ jobs:
           Add-Line ("runner_image: " + $env:ImageOS)
           Add-Line ("CUDA_PATH: " + $env:CUDA_PATH)
           Add-Line "CMAKE_CUDA_ARCHITECTURES: 61"
+          Add-Line "windows_ple_readfile_patch: overlapped-bytecount-v1"
+          Add-Line "source_tree_pristine: no (local source patch applied after checkout; pinned SHA recorded above)"
           Add-Line "--- toolchain ---"
           $cm=try{ (cmake --version | Select-Object -First 1) }catch{ "unavailable" }
           Add-Line ("cmake: " + $cm)
@@ -252,7 +356,7 @@ jobs:
             llama-server-ple-direct-win-cu124-sm61.zip
             llama-server-ple-direct-win-cu124-sm61.zip.sha256
 
-      - name: Upload build logs + manifest + cuda architectures
+      - name: Upload build logs + manifest + cuda architectures + patched source
         if: always()
         uses: actions/upload-artifact@v6
         with:
@@ -265,4 +369,5 @@ jobs:
             version.txt
             toolchain.txt
             cuda-architectures.txt
+            patched-llama-lazy-reader.h
             pkg\BUILD-MANIFEST.txt
