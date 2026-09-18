@@ -5,7 +5,8 @@ name: Build PLE-Direct Windows CUDA 12.4 sm61
 # BOTH CPU and CUDA backends enabled (mixed inference).
 #
 # Hardening:
-#   * local source patch: Windows overlapped READ byte-count fix (llama-lazy-reader.h)
+#   * local source patch: per-worker manual-reset OVERLAPPED event for the Windows
+#     direct PLE reader (windows_ple_readfile_patch: per-worker-event-v2)
 #   * cuobjdump proof that ggml-cuda.dll really contains sm_61 code
 #   * BUILD-MANIFEST.txt (reproducibility + per-file SHA256), shipped in the ZIP
 #   * checkpoint artifact of the raw build
@@ -60,14 +61,14 @@ jobs:
           if ($c -notmatch 'direct reads enabled for') { throw "llama-model.cpp is missing the direct-read activation log" }
           Write-Host "OK: Windows PLE direct-read implementation present (CreateFileW/OVERLAPPED/ReadFile + qwen4exp lazy PLE reader)"
 
-      - name: Patch Windows direct read (authoritative overlapped byte count)
+      - name: Patch Windows direct read (per-worker manual-reset OVERLAPPED event)
         shell: pwsh
         run: |
           $path = "src\src\llama-lazy-reader.h"
           if (-not (Test-Path $path)) { throw "missing $path" }
           $orig = (Get-Content -LiteralPath $path -Raw) -replace "`r`n", "`n"
 
-          $old = @'
+          $old1 = @'
           #ifdef _WIN32
               // one positional read; ReadFile takes a DWORD length, so chunk big rows
               void read_exact(size_t off, uint8_t * dst, size_t n) const {
@@ -94,35 +95,47 @@ jobs:
                   }
               }
           '@
-          $old = $old -replace "`r`n", "`n"
 
-          $new = @'
+          $new1 = @'
           #ifdef _WIN32
-              // one positional read; ReadFile takes a DWORD length, so chunk big rows
-              void read_exact(size_t off, uint8_t * dst, size_t n) const {
+              // one positional read; ReadFile takes a DWORD length, so chunk big rows.
+              // hEvent is a per-worker manual-reset event owned by run_range() and reused
+              // for every row this worker reads. lpNumberOfBytesRead is NULL for the
+              // overlapped handle, and the authoritative transfer count always comes from
+              // GetOverlappedResult() (bytecount-v1 behavior, preserved).
+              void read_exact(size_t off, uint8_t * dst, size_t n, HANDLE hEvent) const {
                   while (n > 0) {
                       const DWORD want = n > 0x7FFFFFFFu ? 0x7FFFFFFFu : (DWORD) n;
                       OVERLAPPED ov = {};
                       ov.Offset     = (DWORD) (off & 0xFFFFFFFFu);
                       ov.OffsetHigh = (DWORD) (off >> 32);
+                      ov.hEvent     = hEvent;
+                      if (!::ResetEvent(hEvent)) {
+                          throw std::runtime_error(format("lazy direct read: ResetEvent failed, error %lu",
+                                  (unsigned long) ::GetLastError()));
+                      }
                       DWORD done = 0;
-                      // The handle is opened with FILE_FLAG_OVERLAPPED, so per Microsoft's
-                      // ReadFile contract lpNumberOfBytesRead must be NULL; the authoritative
-                      // transferred-byte count comes from GetOverlappedResult(..., TRUE) for
-                      // BOTH the synchronous (ReadFile == TRUE) and asynchronous
-                      // (ERROR_IO_PENDING) completion paths.
-                      const BOOL started = ReadFile((HANDLE) file, dst, want, nullptr, &ov);
-                      if (!started) {
-                          const DWORD read_err = GetLastError();
-                          if (read_err != ERROR_IO_PENDING) {
+                      bool resolve_overlapped = true;
+                      if (!::ReadFile((HANDLE) file, dst, want, nullptr, &ov)) {
+                          const DWORD err = ::GetLastError();
+                          if (err == ERROR_HANDLE_EOF) {
+                              resolve_overlapped = false;
+                              done = 0;
+                          } else if (err != ERROR_IO_PENDING) {
                               throw std::runtime_error(format("lazy direct read of %lu bytes at file offset %zu failed, error %lu",
-                                      (unsigned long) want, off, (unsigned long) read_err));
+                                      (unsigned long) want, off, (unsigned long) err));
                           }
                       }
-                      if (!GetOverlappedResult((HANDLE) file, &ov, &done, TRUE)) {
-                          const DWORD ov_err = GetLastError();
-                          throw std::runtime_error(format("lazy direct read of %lu bytes at file offset %zu failed, error %lu",
-                                  (unsigned long) want, off, (unsigned long) ov_err));
+                      if (resolve_overlapped) {
+                          if (!::GetOverlappedResult((HANDLE) file, &ov, &done, TRUE)) {
+                              const DWORD ov_err = ::GetLastError();
+                              if (ov_err == ERROR_HANDLE_EOF) {
+                                  done = 0;
+                              } else {
+                                  throw std::runtime_error(format("lazy direct read of %lu bytes at file offset %zu failed, error %lu",
+                                          (unsigned long) want, off, (unsigned long) ov_err));
+                              }
+                          }
                       }
                       if (done == 0) {
                           throw std::runtime_error(format("lazy direct read of %lu bytes at file offset %zu failed: unexpected EOF",
@@ -134,33 +147,151 @@ jobs:
                   }
               }
           '@
-          $new = $new -replace "`r`n", "`n"
 
-          Write-Host ("patch diag: orig_len={0} old_len={1} orig_CR={2} old_CR={3}" -f $orig.Length, $old.Length, ([regex]::Matches($orig,"`r").Count), ([regex]::Matches($old,"`r").Count))
-          if (-not $orig.Contains($old)) { throw "PATCH ANCHOR NOT FOUND in $path (pinned source changed?)" }
-          $patched = $orig.Replace($old, $new)
-          if ($patched -eq $orig) { throw "patch produced no change" }
-          Set-Content -LiteralPath $path -Value $patched -NoNewline -Encoding utf8
+          $old2 = @'
+              void run_range(const std::vector<std::pair<int32_t, int32_t>> & pairs,
+                             int64_t begin, int64_t end, float * dst) const {
+                  std::vector<uint8_t> bounce(row_size);
+          '@
+
+          $new2 = @'
+              void run_range(const std::vector<std::pair<int32_t, int32_t>> & pairs,
+                             int64_t begin, int64_t end, float * dst) const {
+          #ifdef _WIN32
+                  // exactly ONE manual-reset event per worker invocation, reused for every
+                  // row read below. Passing hEvent == NULL makes the file handle itself the
+                  // completion signal, which is unsafe when several overlapped operations
+                  // share a single handle.
+                  struct handle_guard {
+                      HANDLE h;
+                      ~handle_guard() { if (h) { ::CloseHandle(h); } }
+                  } ev{ ::CreateEventA(nullptr, TRUE, FALSE, nullptr) };
+                  if (!ev.h) {
+                      throw std::runtime_error(format("lazy direct read: CreateEventA failed, error %lu", (unsigned long) ::GetLastError()));
+                  }
+          #endif
+                  std::vector<uint8_t> bounce(row_size);
+          '@
+
+          $old3 = @'
+                      const size_t off = base + (size_t) pairs[(size_t) i].first * row_size;
+                      read_exact(off, bounce.data(), row_size);
+          '@
+
+          $new3 = @'
+                      const size_t off = base + (size_t) pairs[(size_t) i].first * row_size;
+          #ifdef _WIN32
+                      read_exact(off, bounce.data(), row_size, ev.h);
+          #else
+                      read_exact(off, bounce.data(), row_size);
+          #endif
+          '@
+
+          $pairs = @(
+            @{ o = $old1; n = $new1; what = "read_exact: per-worker hEvent" },
+            @{ o = $old2; n = $new2; what = "run_range: one event per worker" },
+            @{ o = $old3; n = $new3; what = "call site: pass worker event" }
+          )
+          $cur = $orig
+          foreach ($p in $pairs) {
+            $o = $p.o -replace "`r`n", "`n"
+            $n = $p.n -replace "`r`n", "`n"
+            if (-not $cur.Contains($o)) { throw ("PATCH ANCHOR NOT FOUND (" + $p.what + ")") }
+            $cnt = ([regex]::Matches($cur, [regex]::Escape($o))).Count
+            if ($cnt -ne 1) { throw ("expected exactly 1 occurrence of anchor (" + $p.what + "), found " + $cnt) }
+            $cur = $cur.Replace($o, $n)
+          }
+          if ($cur -eq $orig) { throw "patch produced no change" }
+          Set-Content -LiteralPath $path -Value $cur -NoNewline -Encoding utf8
           Copy-Item -LiteralPath $path -Destination "patched-llama-lazy-reader.h" -Force
-          Write-Host "Patched $path (windows_ple_readfile_patch: overlapped-bytecount-v1)"
+          Write-Host "Patched $path (windows_ple_readfile_patch: per-worker-event-v2)"
 
       - name: Verify applied source patch (fail unless exactly intended)
         shell: pwsh
         run: |
           $path = "src\src\llama-lazy-reader.h"
           $s = Get-Content -LiteralPath $path -Raw
-          foreach ($t in @("ReadFile","nullptr","GetOverlappedResult","ERROR_IO_PENDING","FILE_FLAG_OVERLAPPED")) {
+
+          foreach ($t in @("CreateEvent","TRUE","ResetEvent","ov.hEvent","ERROR_IO_PENDING","GetOverlappedResult","CloseHandle")) {
             if ($s -notmatch [regex]::Escape($t)) { throw "patched file is missing '$t'" }
           }
-          if ($s -match '&done, &ov') { throw "obsolete ReadFile(..., &done, &ov) call is still present" }
-          if ($s -match 'GetLastError\(\) != ERROR_IO_PENDING \|\|') { throw "old combined ReadFile/GetOverlappedResult condition is still present" }
-          if ($s -notmatch [regex]::Escape('const BOOL started = ReadFile((HANDLE) file, dst, want, nullptr, &ov);')) {
-            throw "ReadFile(nullptr lpNumberOfBytesRead) form not found"
+
+          if ($s -notmatch [regex]::Escape('::CreateEventA(nullptr, TRUE, FALSE, nullptr)')) {
+            throw "CreateEventA(nullptr, TRUE, FALSE, nullptr) not found"
           }
-          if ($s -notmatch [regex]::Escape('if (!GetOverlappedResult((HANDLE) file, &ov, &done, TRUE)) {')) {
-            throw "GetOverlappedResult is not called unconditionally for both completion paths"
+          if ([regex]::Matches($s, 'CreateEventA\(').Count -ne 1) {
+            throw "expected exactly one CreateEventA (one event per worker)"
           }
-          Write-Host "OK: windows_ple_readfile_patch=overlapped-bytecount-v1 verified (GetOverlappedResult supplies done for both TRUE and ERROR_IO_PENDING)"
+          if ($s -notmatch [regex]::Escape('ov.hEvent     = hEvent;')) {
+            throw "OVERLAPPED.hEvent is not assigned the worker event"
+          }
+          if ([regex]::Matches($s, [regex]::Escape('OVERLAPPED ov = {};')).Count -ne 1) {
+            throw "expected exactly one OVERLAPPED usage (the Windows direct read)"
+          }
+          if ($s -notmatch [regex]::Escape('::ReadFile((HANDLE) file, dst, want, nullptr, &ov)')) {
+            throw "bytecount-v1 regression: ReadFile must pass nullptr for lpNumberOfBytesRead"
+          }
+          if ($s -match [regex]::Escape('ReadFile((HANDLE) file, dst, want, &done, &ov)')) {
+            throw "bytecount-v1 regression: ReadFile(..., &done, &ov) must not be used"
+          }
+          if ($s -notmatch [regex]::Escape('if (!::ResetEvent(hEvent)) {')) {
+            throw "ResetEvent return value is not checked"
+          }
+
+          foreach ($marker in @('bool resolve_overlapped = true;',                                'if (err == ERROR_HANDLE_EOF) {',
+                                'resolve_overlapped = false;',
+                                'else if (err != ERROR_IO_PENDING) {',
+                                'if (resolve_overlapped) {',
+                                'if (ov_err == ERROR_HANDLE_EOF) {')) {
+            if ($s -notmatch [regex]::Escape($marker)) { throw "EOF-resolution marker missing: $marker" }
+          }
+          $iGate = $s.IndexOf('if (resolve_overlapped) {')
+          $iGOR  = $s.IndexOf('if (!::GetOverlappedResult((HANDLE) file, &ov, &done, TRUE)) {')
+          if ($iGate -lt 0 -or $iGOR -lt 0 -or $iGOR -lt $iGate) {
+            throw "GetOverlappedResult is not gated behind resolve_overlapped"
+          }
+          if ($s.IndexOf('resolve_overlapped = false;') -lt 0 -or $s.IndexOf('resolve_overlapped = false;') -gt $iGate) {
+            throw "immediate ERROR_HANDLE_EOF does not set resolve_overlapped=false before the gate"
+          }
+
+          # the Windows read path must set hEvent before ReadFile
+          $rx = $s.IndexOf('void read_exact(size_t off, uint8_t * dst, size_t n, HANDLE hEvent)')
+          if ($rx -lt 0) { throw "v2 read_exact signature not found" }
+          $rxEnd = $s.IndexOf('#else', $rx)
+          if ($rxEnd -lt 0) { throw "could not isolate Windows read_exact body" }
+          $rxBody = $s.Substring($rx, $rxEnd - $rx)
+          if ($rxBody -notmatch [regex]::Escape('ov.hEvent     = hEvent;')) { throw "read_exact does not set ov.hEvent" }
+          if ($rxBody -notmatch [regex]::Escape('::ResetEvent(hEvent);'))      { throw "read_exact does not ResetEvent per read" }
+          if ($rxBody -notmatch [regex]::Escape('::GetOverlappedResult'))      { throw "read_exact lacks GetOverlappedResult" }
+          if ($rxBody -match 'CreateEvent') { throw "CreateEvent must be per-worker, not inside the per-read function" }
+
+          # CreateEvent must live in run_range (once per worker)
+          $rr = $s.IndexOf('void run_range(')
+          if ($rr -lt 0) { throw "run_range not found" }
+          if ($s.IndexOf('CreateEventA(') -lt $rr) { throw "CreateEventA is not inside run_range" }
+          $rrBody = $s.Substring($rr)
+          if ($rrBody -notmatch [regex]::Escape('struct handle_guard')) { throw "run_range lacks the RAII handle_guard" }
+          if ($rrBody -notmatch [regex]::Escape('CloseHandle(h)'))      { throw "worker event is not closed via RAII" }
+          if ($rrBody -notmatch [regex]::Escape('read_exact(off, bounce.data(), row_size, ev.h);')) {
+            throw "run_range does not pass the worker event to read_exact on Windows"
+          }
+
+          Write-Host "OK: windows_ple_readfile_patch=per-worker-event-v2 verified (one manual-reset event per worker; hEvent set on every overlapped read; RAII close)"
+
+      - name: Record patch diagnostics (pinned commit, git diff, patched sha256)
+        shell: pwsh
+        run: |
+          $commit = (git -C src rev-parse HEAD).Trim()
+          Write-Host "pinned commit: $commit"
+          if ($commit -ne "${{ env.SRC_SHA }}") { throw "pinned commit mismatch: $commit" }
+          Write-Host "--- git diff -- src/llama-lazy-reader.h ---"
+          git -C src --no-pager diff -- src/llama-lazy-reader.h | Tee-Object -FilePath patch-diff.txt
+          git -C src diff --check
+          if ($LASTEXITCODE -ne 0) { throw "git diff --check failed (whitespace or conflict errors)" }
+          $h = (Get-FileHash "src\src\llama-lazy-reader.h" -Algorithm SHA256).Hash
+          Write-Host "patched llama-lazy-reader.h SHA256: $h"
+          "patched_llama_lazy_reader_sha256=$h" | Set-Content patched-source.sha256
+          Write-Host "patch replacements applied: 3/3 (read_exact, run_range prologue, call site)"
 
       - name: Install CUDA Toolkit 12.4 (official NVIDIA redist, repo action)
         uses: ./src/.github/actions/windows-setup-cuda
@@ -289,12 +420,13 @@ jobs:
           Add-Line ("generated_utc: " + (Get-Date).ToUniversalTime().ToString("o"))
           Add-Line ("source_repository: ${{ env.SRC_REPO }}")
           Add-Line ("source_sha_pinned: ${{ env.SRC_SHA }}")
+          Add-Line ("source_commit: ${{ env.SRC_SHA }}")
           Add-Line ("git_rev_parse_HEAD: " + (git -C src rev-parse HEAD).Trim())
           Add-Line ("runner_os: " + $env:RUNNER_OS)
           Add-Line ("runner_image: " + $env:ImageOS)
           Add-Line ("CUDA_PATH: " + $env:CUDA_PATH)
           Add-Line "CMAKE_CUDA_ARCHITECTURES: 61"
-          Add-Line "windows_ple_readfile_patch: overlapped-bytecount-v1"
+          Add-Line "windows_ple_readfile_patch: per-worker-event-v2"
           Add-Line "source_tree_pristine: no (local source patch applied after checkout; pinned SHA recorded above)"
           Add-Line "--- toolchain ---"
           $cm=try{ (cmake --version | Select-Object -First 1) }catch{ "unavailable" }
@@ -373,4 +505,6 @@ jobs:
             toolchain.txt
             cuda-architectures.txt
             patched-llama-lazy-reader.h
+            patch-diff.txt
+            patched-source.sha256
             pkg\BUILD-MANIFEST.txt
