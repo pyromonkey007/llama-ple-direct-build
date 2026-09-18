@@ -261,7 +261,7 @@ jobs:
           if ($rxEnd -lt 0) { throw "could not isolate Windows read_exact body" }
           $rxBody = $s.Substring($rx, $rxEnd - $rx)
           if ($rxBody -notmatch [regex]::Escape('ov.hEvent     = hEvent;')) { throw "read_exact does not set ov.hEvent" }
-          if ($rxBody -notmatch [regex]::Escape('::ResetEvent(hEvent);'))      { throw "read_exact does not ResetEvent per read" }
+          if ($rxBody -notmatch [regex]::Escape('if (!::ResetEvent(hEvent)) {'))    { throw "read_exact does not ResetEvent per read" }
           if ($rxBody -notmatch [regex]::Escape('::GetOverlappedResult'))      { throw "read_exact lacks GetOverlappedResult" }
           if ($rxBody -match 'CreateEvent') { throw "CreateEvent must be per-worker, not inside the per-read function" }
 
